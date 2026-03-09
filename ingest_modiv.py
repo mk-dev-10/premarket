@@ -1,6 +1,7 @@
 # ingest_modiv.py
 # Pulls NJ parcel and MOD-IV data via the official NJ ArcGIS REST API.
-# To add counties edit COUNTIES in config.py only.
+# Queries by municipality to avoid county level record caps.
+# To add counties: add municipality codes below and update config.py.
 # Field names verified against live API response March 2026.
 
 import requests
@@ -16,13 +17,75 @@ OUTFIELDS = ",".join([
     "YR_CONSTR", "OWNER_NAME", "ST_ADDRESS", "CITY_STATE", "ZIP_CODE"
 ])
 
-def fetch_parcels(county_name, offset=0, batch_size=2000):
+# Official NJ Division of Taxation municipality codes
+# Source: nj.gov/treasury/taxation/pdf/lpt/cntycode.pdf
+# To add a new county add its municipalities here and in config.py
+
+COUNTY_MUNICIPALITIES = {
+    "Monmouth": [
+        "1301",  # ABERDEEN TWP
+        "1302",  # ALLENHURST BORO
+        "1303",  # ALLENTOWN BORO
+        "1304",  # ASBURY PARK CITY
+        "1305",  # ATLANTIC HIGHLANDS BORO
+        "1306",  # AVON BY THE SEA BORO
+        "1307",  # BELMAR BORO
+        "1308",  # BRADLEY BEACH BORO
+        "1309",  # BRIELLE BORO
+        "1310",  # COLTS NECK TWP
+        "1311",  # DEAL BORO
+        "1312",  # EATONTOWN BORO
+        "1313",  # ENGLISHTOWN BORO
+        "1314",  # FAIR HAVEN BORO
+        "1315",  # FARMINGDALE BORO
+        "1316",  # FREEHOLD BORO
+        "1317",  # FREEHOLD TWP
+        "1318",  # HAZLET TWP
+        "1319",  # HIGHLANDS BORO
+        "1320",  # HOLMDEL TWP
+        "1321",  # HOWELL TWP
+        "1322",  # INTERLAKEN BORO
+        "1323",  # KEANSBURG BORO
+        "1324",  # KEYPORT BORO
+        "1325",  # LITTLE SILVER BORO
+        "1326",  # LOCH ARBOUR VILLAGE
+        "1327",  # LONG BRANCH CITY
+        "1328",  # MANALAPAN TWP
+        "1329",  # MANASQUAN BORO
+        "1330",  # MARLBORO TWP
+        "1331",  # MATAWAN BORO
+        "1332",  # MIDDLETOWN TWP
+        "1333",  # MILLSTONE TWP
+        "1334",  # MONMOUTH BEACH BORO
+        "1335",  # NEPTUNE TWP
+        "1336",  # NEPTUNE CITY BORO
+        "1337",  # OCEAN TWP
+        "1338",  # OCEANPORT BORO
+        "1339",  # RED BANK BORO
+        "1340",  # ROOSEVELT BORO
+        "1341",  # RUMSON BORO
+        "1342",  # SEA BRIGHT BORO
+        "1343",  # SEA GIRT BORO
+        "1344",  # SHREWSBURY BORO
+        "1345",  # SHREWSBURY TWP
+        "1346",  # LAKE COMO BORO
+        "1347",  # SPRING LAKE BORO
+        "1348",  # SPRING LAKE HEIGHTS BORO
+        "1349",  # TINTON FALLS BORO
+        "1350",  # UNION BEACH BORO
+        "1351",  # UPPER FREEHOLD TWP
+        "1352",  # WALL TWP
+        "1353",  # WEST LONG BRANCH BORO
+    ]
+}
+
+def fetch_parcels_by_muni(muni_code, offset=0, batch_size=2000):
     """
-    Fetches a batch of parcels from the NJ ArcGIS REST API
-    filtered by county name. Max 2000 records per request.
+    Fetches a batch of parcels for a single municipality.
+    Querying by municipality avoids county level record caps.
     """
     params = {
-        "where":             f"COUNTY='{county_name}'",
+        "where":             f"PCL_MUN='{muni_code}'",
         "outFields":         OUTFIELDS,
         "returnGeometry":    "false",
         "resultOffset":      offset,
@@ -107,26 +170,21 @@ def insert_parcel(cur, attrs):
     }
     cur.execute(sql, record)
 
-def ingest_county(county_name):
+def ingest_municipality(conn, muni_code):
     """
-    Pulls all qualifying parcels for a county and loads them
-    into the properties table in batches of 2000.
+    Pulls all qualifying parcels for a single municipality.
+    Returns count of inserted and skipped records.
     """
-    print(f"\nStarting ingestion for {county_name} County...")
-    conn = get_connection()
     cur = conn.cursor()
-
-    total_inserted = 0
-    total_skipped = 0
+    inserted = 0
+    skipped = 0
     offset = 0
     batch_size = 2000
 
     while True:
-        print(f"  Fetching records {offset} to {offset + batch_size}...")
-        features = fetch_parcels(county_name, offset, batch_size)
+        features = fetch_parcels_by_muni(muni_code, offset, batch_size)
 
         if not features:
-            print(f"  No more records at offset {offset}")
             break
 
         for feature in features:
@@ -134,15 +192,14 @@ def ingest_county(county_name):
             if filter_parcel(attrs):
                 try:
                     insert_parcel(cur, attrs)
-                    total_inserted += 1
+                    inserted += 1
                 except Exception as e:
-                    print(f"  Insert error: {e}")
-                    total_skipped += 1
+                    print(f"    Insert error: {e}")
+                    skipped += 1
             else:
-                total_skipped += 1
+                skipped += 1
 
         conn.commit()
-        print(f"  Committed. Inserted/updated: {total_inserted} | Skipped: {total_skipped}")
 
         if len(features) < batch_size:
             break
@@ -150,6 +207,32 @@ def ingest_county(county_name):
         offset += batch_size
 
     cur.close()
+    return inserted, skipped
+
+def ingest_county(county_name):
+    """
+    Pulls all qualifying parcels for a county by iterating
+    through each municipality individually to avoid record caps.
+    """
+    municipalities = COUNTY_MUNICIPALITIES.get(county_name, [])
+    if not municipalities:
+        print(f"No municipalities found for {county_name}. Check COUNTY_MUNICIPALITIES in ingest_modiv.py")
+        return
+
+    print(f"\nStarting ingestion for {county_name} County...")
+    print(f"Municipalities to process: {len(municipalities)}")
+
+    conn = get_connection()
+    total_inserted = 0
+    total_skipped = 0
+
+    for i, muni_code in enumerate(municipalities):
+        print(f"  [{i+1}/{len(municipalities)}] Municipality {muni_code}...", end=" ")
+        inserted, skipped = ingest_municipality(conn, muni_code)
+        total_inserted += inserted
+        total_skipped += skipped
+        print(f"inserted: {inserted} | skipped: {skipped}")
+
     conn.close()
     print(f"\nCompleted {county_name} County.")
     print(f"Total inserted or updated: {total_inserted}")
@@ -157,8 +240,8 @@ def ingest_county(county_name):
 
 def run_ingestion():
     """
-    Runs ingestion for all counties in config.py.
-    Add counties to config.py to expand coverage.
+    Main entry point. Runs ingestion for all counties in config.py.
+    Add counties to config.py and municipality codes above to expand.
     """
     print("=== PREMARKET MOD-IV INGESTION ===")
     print(f"Counties: {COUNTIES}")
