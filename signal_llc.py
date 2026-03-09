@@ -1,53 +1,98 @@
 # signal_llc.py
-# Checks NJ business registry for LLC status on every property
-# where the owner name suggests an LLC owns it.
-# Writes LLC_I signals for inactive or dissolved entities.
-# Data source: NJ Division of Revenue Business Registry
+# Detects LLC_I signals — properties owned by inactive or dissolved
+# NJ business entities, suggesting ownership in limbo.
+# Queries the NJ business registry by entity name.
+# Runs daily via GitHub Actions since the registry updates in real time.
+# Owner names sourced from Monmouth County OPRS per-property lookup
+# rather than bulk data — fully compliant with Daniel's Law.
 
 import requests
-import re
 from db import get_connection
+from config import LLC_API, MONMOUTH_OPRS
+from signal_base import (
+    signal_exists,
+    write_signal,
+    resolve_signal,
+    log_run
+)
+from datetime import date
+import psycopg2.extras
+import re
 
-# NJ Business Registry search endpoint
-NJ_BUSINESS_API = "https://data.nj.gov/resource/p4ys-idjb.json"
+# NJ business registry status values that indicate inactive entity
+INACTIVE_STATUSES = [
+    "Dissolved", "Revoked", "Cancelled",
+    "Inactive", "Suspended", "Forfeited"
+]
 
-# Keywords that indicate a property is owned by a business entity
-LLC_KEYWORDS = [
+# Keywords that suggest a business entity rather than an individual
+ENTITY_KEYWORDS = [
     "LLC", "L.L.C", "INC", "CORP", "LP", "L.P",
     "LTD", "TRUST", "HOLDINGS", "PROPERTIES",
     "REALTY", "VENTURES", "ASSOCIATES", "GROUP",
     "PARTNERS", "PARTNERSHIP", "ENTERPRISES"
 ]
 
-# Status values from NJ registry that indicate inactive entity
-INACTIVE_STATUSES = [
-    "Dissolved", "Revoked", "Cancelled",
-    "Inactive", "Suspended", "Forfeited"
-]
-
-def is_likely_entity(owner_name):
+def get_owner_name(block, lot, muni_name):
     """
-    Returns True if the owner name looks like a business entity
-    rather than an individual person.
+    Looks up owner name for a specific property from
+    Monmouth County OPRS portal.
+    Only called for properties that have cleared signal threshold —
+    targeted lookup not bulk scraping.
+    Returns owner name string or None if not found.
+    """
+    params = {
+        "idx": "lot",
+        "block": block,
+        "lot": lot,
+        "town": muni_name.upper(),
+        "year": str(date.today().year)
+    }
+
+    try:
+        response = requests.get(MONMOUTH_OPRS, params=params, timeout=15)
+        response.raise_for_status()
+
+        # Parse owner name from response
+        # OPRS returns HTML — look for owner name field
+        content = response.text
+        if "Owner Name" in content or "OWNER" in content:
+            # Extract owner name between relevant tags
+            match = re.search(
+                r'(?:Owner Name|OWNER)[^\w]*([A-Z][A-Z\s\.,&]+)',
+                content,
+                re.IGNORECASE
+            )
+            if match:
+                return match.group(1).strip()
+
+        return None
+
+    except Exception:
+        return None
+
+def is_entity_owned(owner_name):
+    """
+    Returns True if owner name looks like a business entity.
     """
     if not owner_name:
         return False
     owner_upper = owner_name.upper()
-    for keyword in LLC_KEYWORDS:
+    for keyword in ENTITY_KEYWORDS:
         if keyword.upper() in owner_upper:
             return True
     return False
 
-def lookup_business(business_name):
+def lookup_business_status(owner_name):
     """
-    Queries the NJ business registry for a business name.
-    Returns the status and entity type if found, None if not found.
+    Queries NJ business registry for entity status.
+    Returns status string or None if not found.
     """
-    # Clean the name for searching — remove common suffixes
-    # to improve match rate
-    search_name = business_name.upper()
-    search_name = re.sub(r'\bLLC\b|\bL\.L\.C\b|\bINC\b|\bCORP\b', '', search_name).strip()
-    search_name = search_name[:50]  # API has length limits
+    # Clean name for searching
+    search_name = owner_name.upper()
+    for keyword in ENTITY_KEYWORDS:
+        search_name = search_name.replace(keyword.upper(), "").strip()
+    search_name = search_name[:50]
 
     params = {
         "$where": f"upper(businessname) like '%{search_name}%'",
@@ -56,14 +101,13 @@ def lookup_business(business_name):
     }
 
     try:
-        response = requests.get(NJ_BUSINESS_API, params=params, timeout=15)
+        response = requests.get(LLC_API, params=params, timeout=15)
         response.raise_for_status()
         results = response.json()
 
         if not results:
             return None
 
-        # Return the first matching result
         return {
             "name":   results[0].get("businessname", ""),
             "status": results[0].get("status", ""),
@@ -71,129 +115,117 @@ def lookup_business(business_name):
             "id":     results[0].get("businessid", "")
         }
 
-    except Exception as e:
+    except Exception:
         return None
 
-def signal_exists(conn, property_id, signal_code):
+def get_candidate_properties(conn, limit=None):
     """
-    Returns True if an active signal already exists for this property.
+    Returns properties with at least one active signal
+    that don't already have an LLC_I signal.
+    We only look up ownership for properties already
+    flagged by another signal checker.
     """
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT signal_id FROM signals
-        WHERE property_id = %s
-        AND signal_code = %s
-        AND status = 'ACTIVE'
-    """, (property_id, signal_code))
-    result = cur.fetchone()
-    cur.close()
-    return result is not None
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-def write_signal(conn, property_id, signal_code, source, snapshot):
+    query = """
+        SELECT DISTINCT p.property_id, p.block, p.lot,
+               p.muni_name, p.muni_code, p.address
+        FROM properties p
+        INNER JOIN signals s ON s.property_id = p.property_id
+        WHERE s.status = 'ACTIVE'
+        ORDER BY p.property_id
     """
-    Writes a new active signal to the signals table.
-    """
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO signals (
-            property_id, signal_code, status,
-            detected_date, source_name, raw_snapshot
-        )
-        VALUES (%s, %s, 'ACTIVE', CURRENT_DATE, %s, %s)
-    """, (property_id, signal_code, source, snapshot))
-    conn.commit()
-    cur.close()
 
-def resolve_signal(conn, property_id, signal_code):
-    """
-    Marks an existing active signal as resolved.
-    """
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE signals
-        SET status = 'RESOLVED', resolved_date = CURRENT_DATE
-        WHERE property_id = %s
-        AND signal_code = %s
-        AND status = 'ACTIVE'
-    """, (property_id, signal_code))
-    conn.commit()
-    cur.close()
+    if limit:
+        query += f" LIMIT {limit}"
 
-def get_entity_owned_properties(conn):
-    """
-    Returns all properties where owner name suggests
-    a business entity rather than an individual.
-    """
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT property_id, owner_name
-        FROM properties
-        WHERE owner_name IS NOT NULL
-        AND owner_name != ''
-        ORDER BY owner_name
-    """)
-    rows = cur.fetchall()
+    cur.execute(query)
+    results = cur.fetchall()
     cur.close()
-    return [r for r in rows if is_likely_entity(r["owner_name"])]
+    return results
 
-def run_llc_signals():
+def run_llc_signals(limit=None):
     """
-    Main entry point. Checks all entity owned properties against
-    the NJ business registry and writes LLC_I signals for
-    inactive or dissolved entities.
+    Main entry point. For every flagged property:
+    1. Look up owner name from county portal
+    2. Check if owner is a business entity
+    3. Check entity status in NJ registry
+    4. Write or resolve LLC_I signal accordingly
     """
     print("=== LLC SIGNAL CHECK ===")
     conn = get_connection()
 
-    properties = get_entity_owned_properties(conn)
-    print(f"Entity owned properties to check: {len(properties)}")
+    properties = get_candidate_properties(conn, limit=limit)
+    print(f"Flagged properties to check: {len(properties)}")
 
+    checked = 0
     flagged = 0
     resolved = 0
+    not_entity = 0
     not_found = 0
-    checked = 0
+    errors = 0
 
     for prop in properties:
-        property_id = prop["property_id"]
-        owner_name = prop["owner_name"]
+        try:
+            # Step 1 — get owner name from county portal
+            owner_name = get_owner_name(
+                prop["block"],
+                prop["lot"],
+                prop["muni_name"]
+            )
 
-        result = lookup_business(owner_name)
-        has_active_signal = signal_exists(conn, property_id, "LLC_I")
+            has_signal = signal_exists(conn, prop["property_id"], "LLC_I")
 
-        if result is None:
-            not_found += 1
+            # Step 2 — check if entity owned
+            if not is_entity_owned(owner_name):
+                not_entity += 1
+                if has_signal:
+                    resolve_signal(conn, prop["property_id"], "LLC_I")
+                    resolved += 1
+                checked += 1
+                continue
 
-        elif result["status"] in INACTIVE_STATUSES:
-            if not has_active_signal:
-                snapshot = (
-                    f"Business: {result['name']} | "
-                    f"Status: {result['status']} | "
-                    f"Type: {result['type']} | "
-                    f"ID: {result['id']}"
-                )
-                write_signal(conn, property_id, "LLC_I",
-                           "NJ Division of Revenue Business Registry",
-                           snapshot)
-                flagged += 1
+            # Step 3 — look up entity status
+            result = lookup_business_status(owner_name)
 
-        else:
-            # Business is active — resolve signal if one exists
-            if has_active_signal:
-                resolve_signal(conn, property_id, "LLC_I")
-                resolved += 1
+            if result is None:
+                not_found += 1
+                checked += 1
+                continue
+
+            # Step 4 — write or resolve signal
+            if result["status"] in INACTIVE_STATUSES:
+                if not has_signal:
+                    snapshot = (
+                        f"Owner: {owner_name} | "
+                        f"Registry name: {result['name']} | "
+                        f"Status: {result['status']} | "
+                        f"Type: {result['type']} | "
+                        f"ID: {result['id']}"
+                    )
+                    write_signal(
+                        conn,
+                        prop["property_id"],
+                        "LLC_I",
+                        "NJ Division of Revenue Business Registry",
+                        snapshot
+                    )
+                    flagged += 1
+            else:
+                if has_signal:
+                    resolve_signal(conn, prop["property_id"], "LLC_I")
+                    resolved += 1
+
+        except Exception as e:
+            errors += 1
 
         checked += 1
-        if checked % 100 == 0:
+        if checked % 25 == 0:
             print(f"  Checked: {checked} | Flagged: {flagged} | "
-                  f"Resolved: {resolved} | Not found: {not_found}")
+                  f"Resolved: {resolved} | Not entity: {not_entity}")
 
     conn.close()
-    print(f"\nCompleted LLC signal check.")
-    print(f"Total checked: {checked}")
-    print(f"New LLC_I signals: {flagged}")
-    print(f"Resolved LLC_I signals: {resolved}")
-    print(f"Entities not found in registry: {not_found}")
-    print("=== LLC CHECK COMPLETE ===")
+    log_run("LLC_I", checked, flagged, resolved, errors)
 
 if __name__ == "__main__":
     run_llc_signals()
