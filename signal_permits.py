@@ -1,168 +1,152 @@
 # signal_permits.py
-# Checks NJ construction permit activity for every property
-# in the properties table. Writes PERMIT_X signals for properties
-# with no permit activity in over 24 months that also have other
-# signals present. To change the inactivity threshold edit this file.
-# Data source: data.nj.gov NJ Construction Permit Data (Socrata API)
+# Detects PERMIT_X signals — properties with no permit activity
+# for an unusually long time, suggesting neglect or abandonment.
+# Queries the NJ permit database by municipality and cross references
+# against our flagged properties by address matching.
+# Runs weekly via GitHub Actions.
 
 import requests
-from datetime import date, datetime
 from db import get_connection
+from config import PERMITS_API, PERMITS_INACTIVITY_YEARS, PROPERTY_CLASSES
+from signal_base import (
+    get_or_create_property,
+    signal_exists,
+    write_signal,
+    resolve_signal,
+    log_run
+)
+from datetime import date, datetime
+import psycopg2.extras
 
-# NJ Construction Permit Data API on data.nj.gov
-# Runs on Socrata — supports standard SoQL queries
-PERMITS_API = "https://data.nj.gov/resource/w9se-dmra.json"
-
-# How many months of permit inactivity before flagging
-INACTIVITY_MONTHS = 24
-
-def get_last_permit_date(muni_name, block, lot):
+def get_latest_permit_date(address, muni_name):
     """
     Queries the NJ permits API for the most recent permit
-    activity on a specific property identified by municipality,
-    block, and lot. Returns the date of the last permit or None.
+    on a given address and municipality.
+    Returns the date of the most recent permit or None if not found.
     """
+    # Clean address for searching
+    search_address = address.upper().strip()
+    search_muni = muni_name.upper().strip()
+
     params = {
-        "$where": f"municipality='{muni_name}' AND block='{block}' AND lot='{lot}'",
+        "$where": (
+            f"upper(site_street) like '%{search_address[:30]}%' "
+            f"AND upper(municipality_name) like '%{search_muni[:20]}%'"
+        ),
         "$order": "issue_date DESC",
         "$limit": 1
     }
+
     try:
         response = requests.get(PERMITS_API, params=params, timeout=15)
         response.raise_for_status()
-        data = response.json()
-        if data and "issue_date" in data[0]:
-            date_str = data[0]["issue_date"][:10]
-            return datetime.strptime(date_str, "%Y-%m-%d").date()
-        return None
+        results = response.json()
+
+        if not results:
+            return None
+
+        issue_date = results[0].get("issue_date")
+        if not issue_date:
+            return None
+
+        # Parse date — API returns ISO format
+        return datetime.strptime(issue_date[:10], "%Y-%m-%d").date()
+
     except Exception as e:
         return None
 
-def months_since(past_date):
+def is_permit_inactive(latest_permit_date):
     """
-    Returns the number of months between a past date and today.
+    Returns True if the most recent permit is older than
+    PERMITS_INACTIVITY_YEARS or if no permit exists at all.
     """
-    today = date.today()
-    return (today.year - past_date.year) * 12 + (today.month - past_date.month)
+    if latest_permit_date is None:
+        return True
+    years_ago = (date.today() - latest_permit_date).days / 365
+    return years_ago >= PERMITS_INACTIVITY_YEARS
 
-def signal_exists(conn, property_id, signal_code):
+def get_candidate_properties(conn, limit=None):
     """
-    Returns True if an active signal of this type already exists
-    for this property. Prevents duplicate signal entries.
+    Returns properties from our database to check for permit inactivity.
+    In scan on demand architecture these are properties that already
+    have at least one other signal — we use permit inactivity as a
+    corroborating signal not an entry point.
     """
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT signal_id FROM signals
-        WHERE property_id = %s
-        AND signal_code = %s
-        AND status = 'ACTIVE'
-    """, (property_id, signal_code))
-    result = cur.fetchone()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    query = """
+        SELECT DISTINCT p.property_id, p.address, p.muni_name,
+               p.block, p.lot, p.muni_code
+        FROM properties p
+        INNER JOIN signals s ON s.property_id = p.property_id
+        WHERE s.status = 'ACTIVE'
+        AND s.signal_code != 'PERMIT_X'
+        ORDER BY p.property_id
+    """
+
+    if limit:
+        query += f" LIMIT {limit}"
+
+    cur.execute(query)
+    results = cur.fetchall()
     cur.close()
-    return result is not None
+    return results
 
-def write_signal(conn, property_id, signal_code, source, snapshot):
+def run_permit_signals(limit=None):
     """
-    Writes a new signal row to the signals table.
-    Only called after confirming signal does not already exist.
-    """
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO signals (
-            property_id, signal_code, status,
-            detected_date, source_name, raw_snapshot
-        )
-        VALUES (%s, %s, 'ACTIVE', CURRENT_DATE, %s, %s)
-    """, (property_id, signal_code, source, snapshot))
-    conn.commit()
-    cur.close()
-
-def resolve_signal(conn, property_id, signal_code):
-    """
-    Marks an existing active signal as resolved.
-    Called when a property that was flagged now shows recent activity.
-    """
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE signals
-        SET status = 'RESOLVED', resolved_date = CURRENT_DATE
-        WHERE property_id = %s
-        AND signal_code = %s
-        AND status = 'ACTIVE'
-    """, (property_id, signal_code))
-    conn.commit()
-    cur.close()
-
-def get_properties_to_check(conn):
-    """
-    Returns all properties from the properties table.
-    Ordered by muni_name to batch API calls efficiently.
-    """
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT property_id, muni_name, block, lot
-        FROM properties
-        ORDER BY muni_name, block, lot
-    """)
-    rows = cur.fetchall()
-    cur.close()
-    return rows
-
-def run_permit_signals():
-    """
-    Main entry point. Checks every property for permit inactivity
-    and writes or resolves PERMIT_X signals accordingly.
+    Main entry point. Checks permit activity for properties
+    that already have at least one other active signal.
+    Adds PERMIT_X as a corroborating signal where applicable.
     """
     print("=== PERMIT SIGNAL CHECK ===")
     conn = get_connection()
-    properties = get_properties_to_check(conn)
+
+    properties = get_candidate_properties(conn, limit=limit)
     print(f"Properties to check: {len(properties)}")
 
+    checked = 0
     flagged = 0
     resolved = 0
-    checked = 0
+    errors = 0
 
     for prop in properties:
-        property_id = prop["property_id"]
-        muni_name = prop["muni_name"]
-        block = prop["block"]
-        lot = prop["lot"]
+        try:
+            latest_permit = get_latest_permit_date(
+                prop["address"],
+                prop["muni_name"]
+            )
 
-        last_permit = get_last_permit_date(muni_name, block, lot)
-        has_active_signal = signal_exists(conn, property_id, "PERMIT_X")
+            inactive = is_permit_inactive(latest_permit)
+            has_signal = signal_exists(conn, prop["property_id"], "PERMIT_X")
 
-        if last_permit is None:
-            # No permit history found at all
-            # Only flag if property has been in database long enough
-            # to reasonably expect permit activity
-            if not has_active_signal:
-                snapshot = f"No permit history found in NJ DCA database"
-                write_signal(conn, property_id, "PERMIT_X", "NJ DCA Permits API", snapshot)
+            if inactive and not has_signal:
+                snapshot = (
+                    f"Last permit: {latest_permit or 'none found'} | "
+                    f"Address: {prop['address']} | "
+                    f"Municipality: {prop['muni_name']}"
+                )
+                write_signal(
+                    conn,
+                    prop["property_id"],
+                    "PERMIT_X",
+                    "NJ Building Permits API",
+                    snapshot
+                )
                 flagged += 1
 
-        elif months_since(last_permit) >= INACTIVITY_MONTHS:
-            # Last permit was over threshold months ago
-            if not has_active_signal:
-                snapshot = f"Last permit: {last_permit} ({months_since(last_permit)} months ago)"
-                write_signal(conn, property_id, "PERMIT_X", "NJ DCA Permits API", snapshot)
-                flagged += 1
-
-        else:
-            # Recent permit activity — resolve signal if one exists
-            if has_active_signal:
-                resolve_signal(conn, property_id, "PERMIT_X")
+            elif not inactive and has_signal:
+                resolve_signal(conn, prop["property_id"], "PERMIT_X")
                 resolved += 1
 
+        except Exception as e:
+            errors += 1
+
         checked += 1
-        if checked % 100 == 0:
+        if checked % 50 == 0:
             print(f"  Checked: {checked} | Flagged: {flagged} | Resolved: {resolved}")
 
     conn.close()
-    print(f"\nCompleted permit signal check.")
-    print(f"Total checked: {checked}")
-    print(f"New PERMIT_X signals: {flagged}")
-    print(f"Resolved PERMIT_X signals: {resolved}")
-    print("=== PERMIT CHECK COMPLETE ===")
+    log_run("PERMIT_X", checked, flagged, resolved, errors)
 
 if __name__ == "__main__":
     run_permit_signals()
