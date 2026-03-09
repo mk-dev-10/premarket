@@ -1,7 +1,7 @@
 # ingest_modiv.py
 # Pulls NJ parcel and MOD-IV data via the official NJ ArcGIS REST API.
-# Queries by municipality to avoid county level record caps.
-# To add counties: add municipality codes below and update config.py.
+# Runs in small batches to avoid Railway timeout limits.
+# To resume after a timeout it automatically skips completed municipalities.
 # Field names verified against live API response March 2026.
 
 import requests
@@ -10,16 +10,16 @@ from config import COUNTIES, PROPERTY_CLASSES, MIN_ASSESSED_VALUE
 
 ARCGIS_API = "https://services2.arcgis.com/XVOqAjTOJ5P6ngMu/arcgis/rest/services/Parcels_Composite_NJ_WM/FeatureServer/0/query"
 
+# How many municipalities to process per deployment run
+# Keep this low to avoid Railway timeout — increase if runs complete fast
+BATCH_SIZE_MUNIS = 3
+
 OUTFIELDS = ",".join([
     "PAMS_PIN", "PCL_MUN", "PCLBLOCK", "PCLLOT",
     "COUNTY", "MUN_NAME", "PROP_LOC", "PROP_CLASS",
     "LAND_VAL", "IMPRVT_VAL", "LAST_YR_TX", "CALC_ACRE",
     "YR_CONSTR", "OWNER_NAME", "ST_ADDRESS", "CITY_STATE", "ZIP_CODE"
 ])
-
-# Official NJ Division of Taxation municipality codes
-# Source: nj.gov/treasury/taxation/pdf/lpt/cntycode.pdf
-# To add a new county add its municipalities here and in config.py
 
 COUNTY_MUNICIPALITIES = {
     "Monmouth": [
@@ -79,10 +79,24 @@ COUNTY_MUNICIPALITIES = {
     ]
 }
 
+def already_ingested(conn, muni_code):
+    """
+    Returns True if this municipality already has data
+    ingested within the last 30 days. Prevents reprocessing.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) as count FROM properties
+        WHERE muni_code = %s
+        AND modiv_refreshed >= CURRENT_DATE - INTERVAL '30 days'
+    """, (muni_code,))
+    result = cur.fetchone()
+    cur.close()
+    return result and result["count"] > 0
+
 def fetch_parcels_by_muni(muni_code, offset=0, batch_size=2000):
     """
     Fetches a batch of parcels for a single municipality.
-    Querying by municipality avoids county level record caps.
     """
     params = {
         "where":             f"PCL_MUN='{muni_code}'",
@@ -120,7 +134,6 @@ def filter_parcel(attrs):
 def insert_parcel(cur, attrs):
     """
     Inserts or updates a single parcel in the properties table.
-    Safe to run multiple times without creating duplicates.
     """
     owner_address = " ".join(filter(None, [
         str(attrs.get("ST_ADDRESS", "")).strip(),
@@ -211,41 +224,48 @@ def ingest_municipality(conn, muni_code):
 
 def ingest_county(county_name):
     """
-    Pulls all qualifying parcels for a county by iterating
-    through each municipality individually to avoid record caps.
+    Processes municipalities in small batches.
+    Automatically skips already ingested municipalities.
+    Redeploy to continue where it left off.
     """
     municipalities = COUNTY_MUNICIPALITIES.get(county_name, [])
     if not municipalities:
-        print(f"No municipalities found for {county_name}. Check COUNTY_MUNICIPALITIES in ingest_modiv.py")
+        print(f"No municipalities found for {county_name}")
         return
 
-    print(f"\nStarting ingestion for {county_name} County...")
-    print(f"Municipalities to process: {len(municipalities)}")
-
+    print(f"\nIngesting {county_name} County...")
     conn = get_connection()
+
     total_inserted = 0
     total_skipped = 0
+    processed_this_run = 0
 
     for i, muni_code in enumerate(municipalities):
-        print(f"  [{i+1}/{len(municipalities)}] Municipality {muni_code}...", end=" ")
+
+        if already_ingested(conn, muni_code):
+            print(f"  [{i+1}/{len(municipalities)}] {muni_code} — already ingested, skipping")
+            continue
+
+        if processed_this_run >= BATCH_SIZE_MUNIS:
+            print(f"\n  Batch limit reached ({BATCH_SIZE_MUNIS} municipalities).")
+            print(f"  Redeploy to continue from next uningested municipality.")
+            break
+
+        print(f"  [{i+1}/{len(municipalities)}] Municipality {muni_code}...", end=" ", flush=True)
         inserted, skipped = ingest_municipality(conn, muni_code)
         total_inserted += inserted
         total_skipped += skipped
+        processed_this_run += 1
         print(f"inserted: {inserted} | skipped: {skipped}")
 
     conn.close()
-    print(f"\nCompleted {county_name} County.")
-    print(f"Total inserted or updated: {total_inserted}")
-    print(f"Total skipped: {total_skipped}")
+    print(f"\nThis run: inserted {total_inserted} | skipped {total_skipped}")
+    print(f"Municipalities processed this run: {processed_this_run}")
 
 def run_ingestion():
-    """
-    Main entry point. Runs ingestion for all counties in config.py.
-    Add counties to config.py and municipality codes above to expand.
-    """
     print("=== PREMARKET MOD-IV INGESTION ===")
     print(f"Counties: {COUNTIES}")
-    print(f"Property classes: {PROPERTY_CLASSES}")
+    print(f"Municipalities per run: {BATCH_SIZE_MUNIS}")
     for county in COUNTIES:
         ingest_county(county)
     print("\n=== INGESTION COMPLETE ===")
