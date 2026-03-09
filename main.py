@@ -4,6 +4,11 @@ from signal_permits import run_permit_signals
 from signal_llc import run_llc_signals
 from scorer import run_scorer
 from datetime import datetime
+import os
+
+# Set TEST_MODE=true in Railway variables to run on small sample only
+TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
+TEST_LIMIT = 50
 
 def log(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -24,7 +29,10 @@ def verify_database():
 
 def run_pipeline():
     log("=" * 50)
-    log("PREMARKET PIPELINE STARTING")
+    if TEST_MODE:
+        log(f"PREMARKET PIPELINE STARTING — TEST MODE ({TEST_LIMIT} properties)")
+    else:
+        log("PREMARKET PIPELINE STARTING — FULL RUN")
     log("=" * 50)
 
     try:
@@ -44,13 +52,13 @@ def run_pipeline():
     log("Starting signal detection...")
 
     try:
-        run_permit_signals()
+        run_permit_signals(limit=TEST_LIMIT if TEST_MODE else None)
         log("Permit signals complete.")
     except Exception as e:
         log(f"PERMIT SIGNAL ERROR: {e}")
 
     try:
-        run_llc_signals()
+        run_llc_signals(limit=TEST_LIMIT if TEST_MODE else None)
         log("LLC signals complete.")
     except Exception as e:
         log(f"LLC SIGNAL ERROR: {e}")
